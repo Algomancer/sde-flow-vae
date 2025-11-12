@@ -17,6 +17,9 @@ def gauss_logprob(x: Tensor, mean: Tensor, var: Tensor) -> Tensor:
     return -0.5 * ((x - mean) ** 2 / var + var.log() + math.log(2.0 * math.pi)).sum(dim=-1)
 
 
+# ============================================================================
+# Pendulum Data Generation (from original code)
+# ============================================================================
 
 def render_pendulum(theta: float, img_size: int = 32) -> np.ndarray:
     """Render pendulum matching paper implementation."""
@@ -291,6 +294,109 @@ class DiagOUSDE(nn.Module):
         lp_trans = gauss_logprob(y[:, 1:, :], mean, Q).sum(dim=1)
         return (lp0 + lp_trans).float()
 
+def _inv_softplus(y: float) -> float:
+    y = float(y)
+    return math.log(math.expm1(y)) if y > 1e-12 else math.log(max(y, 1e-12))
+
+
+class TimeVaryingDiagOU(nn.Module):
+    def __init__(
+        self,
+        D: int,
+        model_dim: int = 64,
+        hidden: int = 128,
+        max_freq: float = 16.0,
+        init_mu: float = 0.0,
+        init_logk: float = -1.0,
+        init_logs: float = 0.4,
+    ):
+        super().__init__()
+        self.D = D
+        self.t_embed = TimeEmbed(model_dim=model_dim, max_freq=max_freq)
+
+        self.mu_net    = nn.Sequential(nn.Linear(model_dim, hidden), nn.SiLU(), nn.Linear(hidden, D))
+        self.kappa_net = nn.Sequential(nn.Linear(model_dim, hidden), nn.SiLU(), nn.Linear(hidden, D))
+        self.sigma_net = nn.Sequential(nn.Linear(model_dim, hidden), nn.SiLU(), nn.Linear(hidden, D))
+
+        nn.init.zeros_(self.mu_net[-1].weight);   nn.init.zeros_(self.mu_net[-1].bias)
+        nn.init.zeros_(self.kappa_net[-1].weight); nn.init.zeros_(self.sigma_net[-1].weight)
+
+        k0 = F.softplus(torch.tensor(init_logk)).item()
+        s0 = F.softplus(torch.tensor(init_logs)).item()
+        with torch.no_grad():
+            self.mu_net[-1].bias.fill_(init_mu)
+            self.kappa_net[-1].bias.fill_(_inv_softplus(k0))
+            self.sigma_net[-1].bias.fill_(_inv_softplus(s0))
+
+    @staticmethod
+    def _A_Q(kappa: Tensor, sigma: Tensor, dt: Tensor) -> Tuple[Tensor, Tensor]:
+        A = torch.exp(-kappa * dt)
+        two_k_dt = 2.0 * kappa * dt
+        small = (two_k_dt < 1e-6).to(dt.dtype)
+        Q_exact  = (sigma**2) * (1.0 - torch.exp(-two_k_dt)) / (2.0 * kappa).clamp_min(1e-12)
+        Q_taylor = (sigma**2) * dt * (1.0 - kappa * dt + (two_k_dt**2)/6.0)
+        Q = small * Q_taylor + (1.0 - small) * Q_exact
+        return A, Q
+
+    def _coeffs_BT(self, ts_bt1: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+        te = self.t_embed(ts_bt1)                  # [B, T, M]
+        mu    = self.mu_net(te)                    # [B, T, D]
+        kappa = F.softplus(self.kappa_net(te)) + 1e-6
+        sigma = F.softplus(self.sigma_net(te)) + 1e-6
+        return mu, kappa, sigma
+
+    @torch.no_grad()
+    def sample_path(self, ts: Tensor, batch_size: int) -> Tensor:
+        ts = ts.view(1, -1, 1).to(self.t_embed.freqs.device)
+        B, T = batch_size, ts.size(1)
+        mu, kappa, sigma = self._coeffs_BT(ts)     # [1, T, D]
+        mu  = mu.expand(B, -1, -1)
+        kap = kappa.expand(B, -1, -1)
+        sig = sigma.expand(B, -1, -1)
+
+        var0 = (sig[:, 0, :]**2) / (2.0 * kap[:, 0, :])
+        c0 = mu[:, 0, :] + torch.randn(B, self.D, device=ts.device) * var0.sqrt()
+
+        dt = (ts[:, 1:, :] - ts[:, :-1, :]).expand(B, -1, -1).clamp_min(1e-6)  # [B, T-1, 1]
+        A_k, Q_k = self._A_Q(kap[:, :-1, :], sig[:, :-1, :], dt)               # [B, T-1, D]
+        mu_k = mu[:, :-1, :]
+
+        eps = torch.randn(B, T-1, self.D, device=ts.device)
+        noise = eps * Q_k.clamp_min(1e-12).sqrt()
+        b = (1.0 - A_k) * mu_k + noise
+
+        one  = torch.ones(B, 1, self.D, device=ts.device)
+        Phi_prefix = torch.cumprod(A_k, dim=1)
+        Phi_full = torch.cat([one, Phi_prefix], dim=1)                          # [B, T, D]
+
+        denom = Phi_full[:, 1:, :].clamp_min(1e-20)
+        s = b / denom
+        zero = torch.zeros(B, 1, self.D, device=ts.device)
+        S_prefix = torch.cumsum(s, dim=1)
+        S_full = torch.cat([zero, S_prefix], dim=1)
+
+        y = Phi_full * (c0[:, None, :] + S_full)                                 # [B, T, D]
+        return y
+
+    def path_log_prob(self, y: Tensor, ts: Tensor) -> Tensor:
+        B, T, D = y.shape
+        if ts.dim() == 1:
+            ts_bt1 = ts[None, :, None].expand(B, -1, 1)
+        elif ts.dim() == 2:
+            ts_bt1 = ts[:, :, None]
+        else:
+            ts_bt1 = ts
+
+        mu, kappa, sigma = self._coeffs_BT(ts_bt1)                              # [B, T, D]
+        var0 = (sigma[:, 0, :]**2) / (2.0 * kappa[:, 0, :])
+        lp0 = gauss_logprob(y[:, 0, :], mu[:, 0, :], var0)
+
+        dt = (ts_bt1[:, 1:, :] - ts_bt1[:, :-1, :]).clamp_min(1e-6)            # [B, T-1, 1]
+        A_k, Q_k = self._A_Q(kappa[:, :-1, :], sigma[:, :-1, :], dt)            # [B, T-1, D]
+        mean = mu[:, :-1, :] + A_k * (y[:, :-1, :] - mu[:, :-1, :])
+        lp_trans = gauss_logprob(y[:, 1:, :], mean, Q_k).sum(dim=1)
+        return (lp0 + lp_trans).float()
+
 
 # ============================================================================
 # Time features & utilities
@@ -451,7 +557,7 @@ class PosteriorOUEncoder(nn.Module):
         super().__init__()
         self.cond_dim = cond_dim
         self.gru = nn.GRU(input_size=x_dim, hidden_size=hidden, num_layers=1, batch_first=True)
-        self.attn = SoftTimeAttention()
+        #self.attn = SoftTimeAttention()
 
         self.init_head = nn.Sequential(
             nn.Linear(hidden, hidden), nn.SiLU(),
@@ -481,13 +587,13 @@ class PosteriorOUEncoder(nn.Module):
         h_seq, h_last = self.gru(x)
         h_global = h_last[0]
 
-        attn = self.attn(h_seq, t)
+        #attn = self.attn(h_seq, t)
 
-        h0_ctx = h_global + attn[:, 0, :]
+        h0_ctx = h_global #+ attn[:, 0, :]
         m0, logs0 = self.init_head(h0_ctx).chunk(2, dim=-1)
         s0 = F.softplus(logs0) + 1e-6
 
-        ctx = torch.cat([h_global.unsqueeze(1) + attn, t], dim=-1)
+        ctx = torch.cat([h_global.unsqueeze(1) + h_seq, t], dim=-1)
         params = self.step_head(ctx[:, :-1, :])
         mu_k, logk_k, logs_k = params.chunk(3, dim=-1)
         kappa_k = F.softplus(logk_k) + 1e-6
@@ -592,8 +698,8 @@ class PathFlowVAE(nn.Module):
         self.decoder = TemporalDecoder(latent_dim=latent_dim, img_size=img_size)
 
         # Priors
-        self.prior_y = DiagOUSDE(D=latent_dim, init_logk=-1.0, init_logs=0.4)  # Base latent prior
-        self.prior_c = DiagOUSDE(D=cond_dim, init_logk=-1.0, init_logs=0.4)    # Conditioning path prior
+        self.prior_y = TimeVaryingDiagOU(D=latent_dim)  # Base latent prior
+        self.prior_c = TimeVaryingDiagOU(D=cond_dim)    # Conditioning path prior
 
         # Base posterior (OU process)
         self.posterior_c_base = PosteriorOUEncoder(x_dim=latent_dim, cond_dim=cond_dim, hidden=model_dim)
@@ -663,6 +769,7 @@ class PathFlowVAE(nn.Module):
         loss = -elbo.mean()
         
         # Loss dictionary for logging
+        # TODO: move this out for torch compile.
         loss_dict = {
             'total': loss.item(),
             'kl_c': kl_c.mean().item(),
@@ -722,9 +829,6 @@ if __name__ == "__main__":
     print(f"Data shape: {xs_img.shape}")
     print(f"Time shape: {ts_arr.shape}")
     
-    # Visualize training data
-    visualise_sequences(xs_img, 'data.jpg', n_show=6)
-
     # Model parameters
     latent_dim = 8          # Latent dimension for encoded features
     cond_dim = 16            # Conditioning path dimensionality
